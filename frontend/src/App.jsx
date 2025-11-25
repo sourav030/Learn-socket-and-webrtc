@@ -60,7 +60,7 @@ export default function App() {
       endCall();
       setStatus("Partner left. Click Next.");
     });
-  }, [roomId]);
+  }, []);
 
   // START CHAT
   const startChat = () => {
