@@ -1,252 +1,134 @@
-import React, { useEffect, useRef, useState } from "react";
-import { io } from "socket.io-client";
+const express = require("express");
 
-const socket = io("https://learn-socket-and-webrtc-1.onrender.com");
+const http = require("http");
 
-export default function App() {
-  const [name, setName] = useState("");
-  const [screen, setScreen] = useState("name");
-  const [online, setOnline] = useState(0);
-  const [status, setStatus] = useState("idle");
-  const [partner, setPartner] = useState("");
-  const [roomId, setRoomId] = useState(null);
-  const [isCaller, setIsCaller] = useState(false);
+const { Server } = require("socket.io");
 
-  const remoteVideo = useRef();
-  const pcRef = useRef(null);
-  const localStreamRef = useRef(null);
-  
-  // FIX 1: Use a Ref to keep track of roomId inside socket listeners
-  const roomIdRef = useRef(null); 
 
-  useEffect(() => {
-    socket.on("online_users", (count) => setOnline(count));
-    socket.on("waiting", () => setStatus("Finding partner..."));
 
-    socket.on("partner_found", async (data) => {
-      setRoomId(data.roomId);
-      roomIdRef.current = data.roomId; // Update the Ref
-      setPartner(data.partnerName);
-      setIsCaller(data.isCaller);
-      setStatus("Connected!");
+const app = express();
 
-      await startWebRTC(data.isCaller, data.roomId);
-    });
+const server = http.createServer(app);
 
-    socket.on("signal", async ({ data }) => {
-      const pc = pcRef.current;
-      // If signal arrives before PC is made, we can't handle it. 
-      // (The reordering in startWebRTC below fixes this for most cases)
-      if (!pc) return; 
 
-      try {
-        if (data.type === "offer") {
-          await pc.setRemoteDescription(data);
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          
-          // FIX 1 APPLIED: Use roomIdRef.current instead of state
-          socket.emit("signal", { roomId: roomIdRef.current, data: answer });
 
-        } else if (data.type === "answer") {
-          await pc.setRemoteDescription(data);
+const io = new Server(server, {
 
-        } else if (data.candidate) {
-          await pc.addIceCandidate(data);
-        }
-      } catch (error) {
-        console.error("Signaling error:", error);
-      }
-    });
+  cors: { origin: "*" }
 
-    socket.on("partner_left", () => {
-      endCall();
-      setStatus("Partner left. Click Next.");
-      if (remoteVideo.current) remoteVideo.current.srcObject = null;
-    });
-    
-    // Cleanup listener on unmount
-    return () => {
-      socket.off("signal");
-      socket.off("partner_found");
-      // ... remove others if needed
-    };
-  }, []);
+});
 
-  const startChat = () => {
-    if (!name.trim()) return alert("Enter your name first!");
-    socket.emit("set_name", name);
-    setScreen("chat");
-    findPartner();
-  };
 
-  const findPartner = () => {
-    endCall();
-    setPartner("");
-    setStatus("Searching...");
-    socket.emit("find_partner");
-  };
 
-  // --- WEBRTC ---
-  // FIX 2: Pass roomId directly to avoid any state issues
-  async function startWebRTC(isCaller, currentRoomId) {
-    // FIX 3: Initialize PeerConnection BEFORE getUserMedia.
-    // This ensures pcRef.current exists even if camera permission takes time,
-    // so we don't miss offers arriving early.
-    const pc = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
-    });
+let onlineUsers = 0;
 
-    pcRef.current = pc;
+let waitingUser = null;
 
-    pc.ontrack = (event) => {
-        console.log("Track received:", event.streams[0]);
-        if (remoteVideo.current) {
-            remoteVideo.current.srcObject = event.streams[0];
-        }
-    };
 
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        // Use the passed currentRoomId or the Ref
-        socket.emit("signal", { roomId: roomIdRef.current, data: event.candidate });
-      }
-    };
 
-    // Now get media
-    try {
-        localStreamRef.current = await navigator.mediaDevices.getUserMedia({
-            video: true,
-            audio: true
-        });
+io.on("connection", (socket) => {
 
-        // Add tracks to the already created PC
-        localStreamRef.current.getTracks().forEach(track =>
-            pc.addTrack(track, localStreamRef.current)
-        );
+  console.log("Connected:", socket.id);
 
-        // Only create offer if we are the caller
-        if (isCaller) {
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            socket.emit("signal", { roomId: currentRoomId, data: offer });
-        }
-    } catch (err) {
-        console.error("Error accessing media devices:", err);
+  onlineUsers++;
+
+  io.emit("online_users", onlineUsers);
+
+
+
+  socket.on("set_name", (name) => {
+
+    socket.data.name = name;
+
+  });
+
+
+
+  socket.on("find_partner", () => {
+
+    if (!waitingUser) {
+
+      waitingUser = socket;
+
+      socket.emit("waiting");
+
+      return;
+
     }
-  }
 
-  const endCall = () => {
-    if (pcRef.current) {
-        pcRef.current.close();
-        pcRef.current = null;
+
+
+    const partner = waitingUser;
+
+    waitingUser = null;
+
+
+
+    const roomId = socket.id + "#" + partner.id;
+
+
+
+    socket.join(roomId);
+
+    partner.join(roomId);
+
+
+
+    io.to(socket.id).emit("partner_found", {
+
+      roomId,
+
+      isCaller: true,
+
+      partnerName: partner.data.name
+
+    });
+
+
+
+    io.to(partner.id).emit("partner_found", {
+
+      roomId,
+
+      isCaller: false,
+
+      partnerName: socket.data.name
+
+    });
+
+  });
+
+
+
+  socket.on("signal", ({ roomId, data }) => {
+
+    socket.to(roomId).emit("signal", { data });
+
+  });
+
+
+
+  socket.on("disconnect", () => {
+
+    onlineUsers--;
+
+    io.emit("online_users", onlineUsers);
+
+
+
+    if (waitingUser && waitingUser.id === socket.id) {
+
+      waitingUser = null;
+
     }
-    if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((t) => t.stop());
-    }
-    setRoomId(null);
-    roomIdRef.current = null;
-  };
 
-  // ... UI REMAINS THE SAME ...
-  if (screen === "name") {
-    return (
-      <div style={styles.centerScreen}>
-        <h1 style={styles.title}>Video Chat</h1>
-        <input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="Enter your name..."
-          style={styles.input}
-        />
-        <button onClick={startChat} style={styles.button}>Start</button>
-      </div>
-    );
-  }
+  });
 
-  return (
-    <div style={styles.app}>
-      <div style={styles.topBar}>
-        <span>Online Users: {online}</span>
-        <span>Status: {status}</span>
-        <span>Partner: {partner || "None"}</span>
-        <button onClick={findPartner} style={styles.nextBtn}>Next</button>
-      </div>
+});
 
-      <div style={styles.videoContainer}>
-        <video
-          ref={remoteVideo}
-          autoPlay
-          playsInline
-          style={styles.remoteVideo}
-        />
-      </div>
-    </div>
-  );
-}
 
-// Styles (Keep your existing styles)
-const styles = {
-  centerScreen: {
-    height: "100vh",
-    display: "flex",
-    flexDirection: "column",
-    justifyContent: "center",
-    alignItems: "center",
-    background: "#0b0b0b",
-    color: "white"
-  },
-  title: { fontSize: 32, marginBottom: 20 },
-  input: {
-    padding: "10px 15px",
-    fontSize: 18,
-    borderRadius: 8,
-    border: "1px solid #555",
-    outline: "none",
-    width: 250,
-    marginBottom: 20,
-  },
-  button: {
-    padding: "10px 25px",
-    fontSize: 18,
-    borderRadius: 8,
-    background: "#1e90ff",
-    border: "none",
-    color: "white",
-    cursor: "pointer"
-  },
-  app: {
-    background: "#111",
-    height: "100vh",
-    color: "white",
-    paddingTop: 10
-  },
-  topBar: {
-    display: "flex",
-    justifyContent: "space-around",
-    padding: 15,
-    background: "#1a1a1a",
-    borderBottom: "1px solid #333",
-    fontSize: 16
-  },
-  nextBtn: {
-    padding: "6px 14px",
-    background: "red",
-    border: "none",
-    color: "white",
-    borderRadius: 8,
-    cursor: "pointer"
-  },
-  videoContainer: {
-    display: "flex",
-    justifyContent: "center",
-    marginTop: 40
-  },
-  remoteVideo: {
-    width: 420,
-    height: 300,
-    background: "black",
-    borderRadius: 12,
-    border: "2px solid #333"
-  }
-};
+
+const PORT = process.env.PORT || 3000;
+
+server.listen(PORT, () => console.log("Server running on " + PORT));
+

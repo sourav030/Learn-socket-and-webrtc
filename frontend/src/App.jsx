@@ -1,9 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
 
-// LOCAL OR DEPLOYED BACKEND
 const socket = io("https://learn-socket-and-webrtc-1.onrender.com");
-// const socket = io("https://learn-socket-and-webrtc-1.onrender.com");
 
 export default function App() {
   const [name, setName] = useState("");
@@ -17,52 +15,66 @@ export default function App() {
   const remoteVideo = useRef();
   const pcRef = useRef(null);
   const localStreamRef = useRef(null);
+  
+  // FIX 1: Use a Ref to keep track of roomId inside socket listeners
+  const roomIdRef = useRef(null); 
 
-  // SOCKET LISTENERS
   useEffect(() => {
     socket.on("online_users", (count) => setOnline(count));
-
     socket.on("waiting", () => setStatus("Finding partner..."));
 
     socket.on("partner_found", async (data) => {
       setRoomId(data.roomId);
+      roomIdRef.current = data.roomId; // Update the Ref
       setPartner(data.partnerName);
       setIsCaller(data.isCaller);
       setStatus("Connected!");
 
-      await startWebRTC(data.isCaller);
+      await startWebRTC(data.isCaller, data.roomId);
     });
 
     socket.on("signal", async ({ data }) => {
       const pc = pcRef.current;
-      if (!pc) return;
+      // If signal arrives before PC is made, we can't handle it. 
+      // (The reordering in startWebRTC below fixes this for most cases)
+      if (!pc) return; 
 
-      if (data.type === "offer") {
-        await pc.setRemoteDescription(data);
+      try {
+        if (data.type === "offer") {
+          await pc.setRemoteDescription(data);
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          
+          // FIX 1 APPLIED: Use roomIdRef.current instead of state
+          socket.emit("signal", { roomId: roomIdRef.current, data: answer });
 
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
+        } else if (data.type === "answer") {
+          await pc.setRemoteDescription(data);
 
-        socket.emit("signal", { roomId, data: answer });
-
-      } else if (data.type === "answer") {
-        await pc.setRemoteDescription(data);
-
-      } else if (data.candidate) {
-        await pc.addIceCandidate(data);
+        } else if (data.candidate) {
+          await pc.addIceCandidate(data);
+        }
+      } catch (error) {
+        console.error("Signaling error:", error);
       }
     });
 
     socket.on("partner_left", () => {
       endCall();
       setStatus("Partner left. Click Next.");
-      remoteVideo.current.srcObject = null;
+      if (remoteVideo.current) remoteVideo.current.srcObject = null;
     });
+    
+    // Cleanup listener on unmount
+    return () => {
+      socket.off("signal");
+      socket.off("partner_found");
+      // ... remove others if needed
+    };
   }, []);
 
   const startChat = () => {
     if (!name.trim()) return alert("Enter your name first!");
-
     socket.emit("set_name", name);
     setScreen("chat");
     findPartner();
@@ -76,48 +88,67 @@ export default function App() {
   };
 
   // --- WEBRTC ---
-  async function startWebRTC(isCaller) {
-    localStreamRef.current = await navigator.mediaDevices.getUserMedia({
-      video: true,
-      audio: true
-    });
-
+  // FIX 2: Pass roomId directly to avoid any state issues
+  async function startWebRTC(isCaller, currentRoomId) {
+    // FIX 3: Initialize PeerConnection BEFORE getUserMedia.
+    // This ensures pcRef.current exists even if camera permission takes time,
+    // so we don't miss offers arriving early.
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
     });
 
     pcRef.current = pc;
 
-    localStreamRef.current.getTracks().forEach(track =>
-      pc.addTrack(track, localStreamRef.current)
-    );
-
     pc.ontrack = (event) => {
-      remoteVideo.current.srcObject = event.streams[0];
+        console.log("Track received:", event.streams[0]);
+        if (remoteVideo.current) {
+            remoteVideo.current.srcObject = event.streams[0];
+        }
     };
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        socket.emit("signal", { roomId, data: event.candidate });
+        // Use the passed currentRoomId or the Ref
+        socket.emit("signal", { roomId: roomIdRef.current, data: event.candidate });
       }
     };
 
-    if (isCaller) {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socket.emit("signal", { roomId, data: offer });
+    // Now get media
+    try {
+        localStreamRef.current = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: true
+        });
+
+        // Add tracks to the already created PC
+        localStreamRef.current.getTracks().forEach(track =>
+            pc.addTrack(track, localStreamRef.current)
+        );
+
+        // Only create offer if we are the caller
+        if (isCaller) {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            socket.emit("signal", { roomId: currentRoomId, data: offer });
+        }
+    } catch (err) {
+        console.error("Error accessing media devices:", err);
     }
   }
 
   const endCall = () => {
-    if (pcRef.current) pcRef.current.close();
-    pcRef.current = null;
-
-    if (localStreamRef.current)
-      localStreamRef.current.getTracks().forEach((t) => t.stop());
+    if (pcRef.current) {
+        pcRef.current.close();
+        pcRef.current = null;
+    }
+    if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((t) => t.stop());
+    }
+    setRoomId(null);
+    roomIdRef.current = null;
   };
 
-  // --- UI ---
+  // ... UI REMAINS THE SAME ...
   if (screen === "name") {
     return (
       <div style={styles.centerScreen}>
@@ -154,8 +185,7 @@ export default function App() {
   );
 }
 
-/* ---------- STYLES ---------- */
-
+// Styles (Keep your existing styles)
 const styles = {
   centerScreen: {
     height: "100vh",
